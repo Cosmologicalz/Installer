@@ -6,12 +6,24 @@ import logging
 from logging.handlers import RotatingFileHandler
 from datetime import datetime
 import sys
-import subprocess # For opening files in default editor
+import subprocess # For opening files in default editor and running restart script
+import shutil # For moving directories
+import time # For delays in restart scripts
+import tempfile # For temporary files/directories during update
+
+# Try to import requests for GitHub API interaction. If not found, notify user.
+try:
+    import requests
+except ImportError:
+    requests = None
+    print("Warning: 'requests' library not found. Update Installer feature will be unavailable.")
 
 # Ensure Pillow is available for dummy icon generation
 try:
     from PIL import Image, ImageDraw
 except ImportError:
+    Image = None
+    ImageDraw = None
     print("Pillow not found. Install it with 'pip install Pillow' to generate a dummy icon if 'icon.png' is missing.")
     print("The app will run, but may not display an icon without 'Pillow' or 'icon.png'.")
 
@@ -25,31 +37,63 @@ class GitHubInstallerApp(tk.Tk):
     installation features.
     """
 
+    DEFAULT_APP_VERSION = "v0.2.4-pre-alpha" # Updated default version
+    GITHUB_REPO_FOR_UPDATES_API = "https://api.github.com/repos/Cosmologicalz/Installer/releases/latest"
+    # Direct raw content link for the .pyw file (assuming main branch always has the latest for this repo)
+    GITHUB_RAW_PYW_URL = "https://raw.githubusercontent.com/Cosmologicalz/Installer/refs/heads/main/installer.pyw"
+    INSTALLER_FILENAME = os.path.basename(sys.argv[0]) # Name of the current .pyw file
+
     def __init__(self):
         super().__init__()
 
-        self.resources_path = self._get_resource_path("resources")
+        # Determine the application's root directory (where the .pyw file is)
+        self.app_root_path = self._get_app_root_path()
+        # Path to the specific config file that stores resources folder location
+        self.path_config_file = os.path.join(self.app_root_path, "installer_path_config.json")
+        
+        # Determine the actual path to the 'resources' folder based on config
+        self.resources_path = self._determine_resource_folder_path()
+
+        # --- CRITICAL FIX START ---
+        # Ensure the resources directory exists BEFORE setting up logging.
+        # Logging handlers will try to create/open log files in this directory.
+        if not os.path.exists(self.resources_path):
+            try:
+                os.makedirs(self.resources_path, exist_ok=True)
+                # Print directly as logger is not fully set up yet
+                print(f"INFO: Created missing resources folder: {self.resources_path}")
+            except Exception as e:
+                print(f"CRITICAL: Failed to create resources folder {self.resources_path}: {e}")
+                messagebox.showerror("Critical Error", f"Failed to create essential 'resources' folder:\n{e}\nApplication cannot proceed.")
+                sys.exit(1) # Exit if we can't even create the resources folder
+        # --- CRITICAL FIX END ---
+
+
+        # Define paths for log and data files, now relative to the determined resources_path
         self.log_file = os.path.join(self.resources_path, "log.log")
         self.his_log_file = os.path.join(self.resources_path, "his.log")
         self.dow_log_file = os.path.join(self.resources_path, "dow.log")
         self.crash_log_file = os.path.join(self.resources_path, "crash.log")
         self.data_json_file = os.path.join(self.resources_path, "data.json")
+        # Icon path is now inside resources
+        self.icon_path = os.path.join(self.resources_path, "icon.png")
 
-        self.logger = self._setup_logging()
-        self._startup_checks()
 
-        self.app_version = self._load_version() # Load version before UI setup
+        # Set up logging now that resources folder is guaranteed to exist
+        self.logger = self._setup_logging() 
+        self._startup_checks() # Perform further checks on individual files and version sync
+
+        self.app_version = self._load_version() # Load version from data.json
         self.title(f"GitHub Repo Installer - {self.app_version}")
         self.geometry("800x600")
 
         # Handle icon.png (create dummy if not exists, then load)
-        icon_path = self._get_resource_path("icon.png")
-        if not os.path.exists(icon_path):
-            self._create_dummy_icon(icon_path)
+        if not os.path.exists(self.icon_path):
+            self._create_dummy_icon(self.icon_path)
         try:
-            self.iconphoto(False, tk.PhotoImage(file=icon_path))
+            self.iconphoto(False, tk.PhotoImage(file=self.icon_path))
         except tk.TclError:
-            self.logger.warning(f"Could not load icon from {icon_path}. Ensure it's a valid PNG.")
+            self.logger.warning(f"Could not load icon from {self.icon_path}. Ensure it's a valid PNG.")
 
 
         self._setup_ui()
@@ -61,33 +105,97 @@ class GitHubInstallerApp(tk.Tk):
         # Developer console window reference
         self.developer_console_window = None
 
-    def _get_resource_path(self, relative_path):
-        """
-        Get the absolute path to a resource, handling both development
-        and PyInstaller bundled environments.
-        """
+    def _get_app_root_path(self):
+        """Gets the root directory where the .pyw executable is located."""
         try:
             # PyInstaller creates a temp folder and stores path in _MEIPASS
             base_path = sys._MEIPASS
         except AttributeError:
-            base_path = os.path.abspath(".")
-        return os.path.join(base_path, relative_path)
+            # For development, get the directory of the script itself
+            base_path = os.path.abspath(os.path.dirname(sys.argv[0]))
+        return base_path
+
+    def _determine_resource_folder_path(self):
+        """
+        Determines the absolute path to the 'resources' folder.
+        It first checks 'installer_path_config.json' for a stored path.
+        If not found or invalid, it defaults to a 'resources' folder
+        inside the application's root directory.
+        """
+        app_root = self._get_app_root_path()
+        
+        # Ensure installer_path_config.json exists and is initialized
+        # This check must happen before logging is fully set up, so it's simple file ops.
+        if not os.path.exists(self.path_config_file):
+            # If config file doesn't exist, create it with default path (app_root)
+            try:
+                with open(self.path_config_file, "w") as f:
+                    json.dump({"resources_base_dir": app_root}, f, indent=4)
+                # print(f"Created initial installer_path_config.json at {self.path_config_file}") # Use print before logger is fully setup
+            except Exception as e:
+                # Fallback to app_root if config file creation fails
+                print(f"Error creating initial installer_path_config.json: {e}. Using app root for resources.")
+        
+        resources_base_dir = app_root # Default base if config fails
+        try:
+            with open(self.path_config_file, "r") as f:
+                config = json.load(f)
+                configured_base = config.get("resources_base_dir")
+                # Validate the configured path: must be a directory and contain a 'resources' subdir
+                # Check for existence of the *potential* resources folder
+                if configured_base and os.path.isdir(os.path.join(configured_base, "resources")):
+                    resources_base_dir = configured_base
+                else:
+                    # If configured path is invalid, log and revert to app_root
+                    # We can't use self.logger yet, so print.
+                    print(f"Warning: Configured resources_base_dir '{configured_base}' in {self.path_config_file} is invalid or missing. Using app root.")
+                    # Also update the config file to reflect the valid path
+                    self._save_path_config(app_root) 
+        except (FileNotFoundError, json.JSONDecodeError) as e:
+            # If config file has issues, log and revert to app_root
+            print(f"Warning: Error reading installer_path_config.json ({e}). Using app root as default resources base directory.")
+            self._save_path_config(app_root) # Recreate/reset if error
+
+        return os.path.join(resources_base_dir, "resources")
+
+    def _save_path_config(self, resources_base_dir):
+        """Saves the resources_base_dir to installer_path_config.json."""
+        try:
+            with open(self.path_config_file, "w") as f:
+                json.dump({"resources_base_dir": resources_base_dir}, f, indent=4)
+            # Use self.logger if available, otherwise print
+            if hasattr(self, 'logger'):
+                self.logger.debug(f"Updated resources_base_dir in {self.path_config_file} to: {resources_base_dir}")
+            else:
+                print(f"DEBUG: Updated resources_base_dir in {self.path_config_file} to: {resources_base_dir}")
+        except Exception as e:
+            if hasattr(self, 'logger'):
+                self.logger.error(f"Error saving installer_path_config.json: {e}", exc_info=True)
+            else:
+                print(f"ERROR: Error saving installer_path_config.json: {e}")
+
 
     def _create_dummy_icon(self, path):
         """Creates a dummy icon.png if it doesn't exist, using Pillow."""
-        try:
-            img = Image.new('RGB', (32, 32), color=(73, 109, 137))
-            d = ImageDraw.Draw(img)
-            d.text((8, 5), "G", fill=(255, 255, 255), font_size=20) # Use font_size for better scaling
-            img.save(path)
-            self.logger.info(f"Created dummy icon.png at {path}")
-        except Exception as e:
-            self.logger.warning(f"Failed to create dummy icon.png: {e}. Please ensure Pillow is installed.")
+        if Image and ImageDraw:
+            try:
+                img = Image.new('RGB', (32, 32), color=(73, 109, 137))
+                d = ImageDraw.Draw(img)
+                # Adjust font_size for clearer text on icon
+                d.text((8, 5), "G", fill=(255, 255, 255), font_size=20)
+                img.save(path)
+                self.logger.info(f"Created dummy icon.png at {path}")
+            except Exception as e:
+                self.logger.warning(f"Failed to create dummy icon.png: {e}. Please ensure Pillow is installed and functional.")
+        else:
+            self.logger.warning("Pillow not available. Cannot create dummy icon.png.")
+
 
     def _setup_logging(self):
         """
         Sets up the custom logging system for the application,
         directing output to console, main log file, and GUI.
+        This assumes self.resources_path exists.
         """
         logger = logging.getLogger("GitHubInstaller")
         logger.setLevel(logging.DEBUG)
@@ -96,18 +204,18 @@ class GitHubInstallerApp(tk.Tk):
         for handler in list(logger.handlers):
             logger.removeHandler(handler)
 
-        # Custom formatter for file and console
+        # Custom formatter for file and console (detailed)
         formatter = logging.Formatter(
             fmt="[%(asctime)s][%(levelname)s] --- %(message)s --- [%(filename)s - %(funcName)s - %(lineno)d]",
             datefmt="%H:%M:%S"
         )
-        # Formatter for GUI (simpler, without full context)
+        # Formatter for GUI (simpler, without full context for readability)
         gui_formatter = logging.Formatter("[%(asctime)s][%(levelname)s] %(message)s", datefmt="%H:%M:%S")
 
-        # File handler for log.log (general log)
-        file_handler = RotatingFileHandler(self.log_file, maxBytes=10*1024*1024, backupCount=5)
-        file_handler.setFormatter(formatter)
-        logger.addHandler(file_handler)
+        # File handler for log.log (general log) - Keep a reference to this for closing
+        self._main_file_handler = RotatingFileHandler(self.log_file, maxBytes=10*1024*1024, backupCount=5)
+        self._main_file_handler.setFormatter(formatter)
+        logger.addHandler(self._main_file_handler)
 
         # Console handler (for debugging if run as .py)
         console_handler = logging.StreamHandler(sys.stdout)
@@ -121,21 +229,41 @@ class GitHubInstallerApp(tk.Tk):
 
         return logger
 
+    def _close_main_log_handlers(self):
+        """
+        Closes the main log file handlers (`log.log`) to release file locks.
+        """
+        self.logger.info("Attempting to close main log file handlers to release file locks.")
+        if hasattr(self, '_main_file_handler') and self._main_file_handler in self.logger.handlers:
+            self.logger.removeHandler(self._main_file_handler)
+            self._main_file_handler.close()
+            self.logger.info("Main log.log file handler closed.")
+        
+        # The _log_to_specific_file function already handles adding/removing its handlers per call,
+        # so this primarily targets the main log.log handler.
+
+
     def _log_to_specific_file(self, level, message, filename, exc_info=None):
         """
         Logs a message to a specific log file in addition to the main log.
-        This uses a separate logger to avoid issues with main logger's handlers.
+        This uses a temporary separate logger and its handler for each call
+        to ensure no persistent file locks.
         """
         specific_logger = logging.getLogger(f"SpecificLogger_{os.path.basename(filename)}")
         specific_logger.setLevel(logging.DEBUG)
-        if not specific_logger.handlers: # Only add handler once
-            file_handler = RotatingFileHandler(filename, maxBytes=10*1024*1024, backupCount=5)
-            formatter = logging.Formatter(
-                fmt="[%(asctime)s][%(levelname)s] --- %(message)s --- [%(filename)s - %(funcName)s - %(lineno)d]",
-                datefmt="%H:%M:%S"
-            )
-            file_handler.setFormatter(formatter)
-            specific_logger.addHandler(file_handler)
+        
+        # Ensure no duplicate handlers for this temporary logger
+        for handler in list(specific_logger.handlers):
+            specific_logger.removeHandler(handler)
+
+        # Add a new file handler for this specific log file
+        file_handler = RotatingFileHandler(filename, maxBytes=10*1024*1024, backupCount=5)
+        formatter = logging.Formatter(
+            fmt="[%(asctime)s][%(levelname)s] --- %(message)s --- [%(filename)s - %(funcName)s - %(lineno)d]",
+            datefmt="%H:%M:%S"
+        )
+        file_handler.setFormatter(formatter)
+        specific_logger.addHandler(file_handler)
 
         if level == logging.INFO:
             specific_logger.info(message)
@@ -145,26 +273,31 @@ class GitHubInstallerApp(tk.Tk):
             specific_logger.error(message, exc_info=exc_info)
         elif level == logging.CRITICAL:
             specific_logger.critical(message, exc_info=exc_info)
+        
+        # Crucially, remove and close the handler immediately after logging
+        specific_logger.removeHandler(file_handler)
+        file_handler.close()
+
 
     def _startup_checks(self):
         """
         Performs essential startup checks:
-        - Creates 'resources' folder if missing.
         - Ensures all required log files and data.json exist, recreating them if missing.
+        - Synchronizes the app version in data.json with DEFAULT_APP_VERSION.
+        - Creates icon.png in resources if missing.
         """
         self.logger.info("Performing startup checks...")
         try:
-            if not os.path.exists(self.resources_path):
-                os.makedirs(self.resources_path)
-                self.logger.info(f"Created resources folder: {self.resources_path}")
-
-            # Ensure data.json exists first to load version
+            # Ensure data.json exists first to handle version loading
             if not os.path.exists(self.data_json_file):
                 with open(self.data_json_file, "w") as f:
-                    json.dump({"github_history": [], "download_dir": os.getcwd(), "current_version": "v0.1-pre-alpha"}, f, indent=4)
+                    json.dump({"github_history": [], "download_dir": os.getcwd(), "current_version": self.DEFAULT_APP_VERSION}, f, indent=4)
                 self.logger.info(f"Created missing data.json file: {os.path.basename(self.data_json_file)}")
+            else:
+                # Synchronize app version
+                self._synchronize_app_version()
 
-            # Now, check and create log files
+            # Now, check and create log files using the determined resources_path
             required_files = {
                 self.log_file: "[TIMESTAMP] --- Application Session Start ---",
                 self.his_log_file: "[TIMESTAMP] --- History Log Start ---",
@@ -178,9 +311,14 @@ class GitHubInstallerApp(tk.Tk):
                         f.write(f"\n{datetime.now().strftime('%Y-%m-%d %H:%M:%S')} {header_content}\n")
                     self.logger.info(f"Created missing log file: {os.path.basename(file_path)}")
 
+            # Check and create icon.png in resources folder
+            if not os.path.exists(self.icon_path):
+                self._create_dummy_icon(self.icon_path)
+
+
             self.logger.info("Startup checks complete. All resources are ready.")
 
-            # Append session start header to log.log
+            # Append session start header to log.log (main log)
             with open(self.log_file, "a") as f:
                 f.write(f"\n{datetime.now().strftime('%Y-%m-%d %H:%M:%S')} --- Application Session Start ---\n")
 
@@ -190,20 +328,54 @@ class GitHubInstallerApp(tk.Tk):
             messagebox.showerror("Critical Error", f"The application encountered a fatal error during startup and cannot proceed:\n{e}\nCheck crash.log for details.")
             self.destroy() # Close the application if critical files can't be set up
 
+    def _synchronize_app_version(self):
+        """
+        Reads the version from data.json and updates it to DEFAULT_APP_VERSION
+        if they do not match.
+        """
+        try:
+            with open(self.data_json_file, "r+") as f:
+                data = json.load(f)
+                json_version = data.get("current_version")
+                
+                if json_version != self.DEFAULT_APP_VERSION:
+                    self.logger.info(f"Synchronizing app version: data.json '{json_version}' -> DEFAULT '{self.DEFAULT_APP_VERSION}'")
+                    data["current_version"] = self.DEFAULT_APP_VERSION
+                    f.seek(0)
+                    json.dump(data, f, indent=4)
+                    f.truncate()
+                    self.app_version = self.DEFAULT_APP_VERSION # Update in-memory version
+                else:
+                    self.logger.debug(f"App version in data.json ({json_version}) already matches DEFAULT_APP_VERSION ({self.DEFAULT_APP_VERSION}).")
+        except (FileNotFoundError, json.JSONDecodeError) as e:
+            self.logger.error(f"Failed to synchronize app version due to data.json error: {e}. Will use DEFAULT_APP_VERSION.", exc_info=True)
+            # If data.json is problematic, _startup_checks will ensure it's created/reset with default version.
+        except Exception as e:
+            self.logger.critical(f"Unexpected error during version synchronization: {e}", exc_info=True)
+            self._log_to_specific_file(logging.CRITICAL, f"Unexpected error during version synchronization: {e}", self.crash_log_file, exc_info=True)
+
+
     def _load_version(self):
         """Loads the current version from data.json."""
         try:
             with open(self.data_json_file, "r") as f:
                 data = json.load(f)
-                version = data.get("current_version", "vUnknown")
+                # Default to DEFAULT_APP_VERSION if "current_version" key is missing
+                version = data.get("current_version", self.DEFAULT_APP_VERSION)
                 self.logger.info(f"Loaded application version: {version}")
                 return version
         except (FileNotFoundError, json.JSONDecodeError):
-            self.logger.warning("data.json not found or corrupted during version load. Defaulting to v0.1-pre-alpha.")
-            return "v0.1-pre-alpha"
+            self.logger.warning(f"data.json not found or corrupted during version load. Defaulting to {self.DEFAULT_APP_VERSION}.")
+            return self.DEFAULT_APP_VERSION
+        except Exception as e:
+            self.logger.error(f"An unexpected error occurred while loading version: {e}", exc_info=True)
+            return self.DEFAULT_APP_VERSION
 
     def _save_version(self):
         """Saves the current version to data.json."""
+        # This function is implicitly handled by _synchronize_app_version during startup
+        # and _save_app_state during shutdown/state changes.
+        self.logger.debug("Explicit _save_version called. Version handled by _synchronize_app_version or _save_app_state.")
         try:
             with open(self.data_json_file, "r+") as f:
                 data = json.load(f)
@@ -369,12 +541,14 @@ class GitHubInstallerApp(tk.Tk):
                 self.create_folder_on_extract_var.set(data.get("create_folder_on_extract", True))
                 self.delete_zip_after_extract_var.set(data.get("delete_zip_after_extract", False))
 
-                # Note: App version is loaded separately by _load_version()
+                # App version is loaded separately by _load_version() and handled in data.json's creation/default
 
                 self.logger.info("Application state loaded.")
         except FileNotFoundError:
             self.logger.warning("data.json not found during app state load. Initializing with default state.")
-            self._save_app_state() # Create a new one
+            # _startup_checks already ensures data.json exists, so this should only happen if deleted mid-run.
+            # In that case, saving app state will re-create it.
+            self._save_app_state() 
         except json.JSONDecodeError:
             self.logger.error("Error decoding data.json during app state load. File might be corrupted. Initializing with default state.", exc_info=True)
             self._log_to_specific_file(logging.ERROR, "Error decoding data.json. File might be corrupted.", self.crash_log_file, exc_info=True)
@@ -409,6 +583,10 @@ class GitHubInstallerApp(tk.Tk):
                 "delete_zip_after_extract": self.delete_zip_after_extract_var.get(),
                 "current_version": self.app_version # Save the current version
             }
+            # Ensure resources directory exists before trying to write data.json
+            if not os.path.exists(self.resources_path):
+                os.makedirs(self.resources_path)
+            
             with open(self.data_json_file, "w") as f:
                 json.dump(app_state, f, indent=4)
             self.logger.info("Application state saved.")
@@ -450,16 +628,271 @@ class GitHubInstallerApp(tk.Tk):
         self.logger.debug(f"Quick Options: Extract={self.extract_on_download_var.get()}, CreateFolder={self.create_folder_on_extract_var.get()}, DeleteZIP={self.delete_zip_after_extract_var.get()}")
 
 
-    # --- Menu Bar Action Stubs ---
+    # --- Menu Bar Actions ---
     def _move_resources_folder(self):
-        """Stub for moving the resources folder."""
-        self.logger.info("Attempted to move resources folder. (Feature not yet implemented)")
-        messagebox.showinfo("Feature Not Implemented", "Moving the resources folder is not yet implemented.")
+        """
+        Prompts the user to select a new location for the 'resources' folder,
+        moves it, updates the path configuration, and restarts the application.
+        """
+        self.logger.info("Initiating 'Move resources folder' process.")
+        new_parent_dir = filedialog.askdirectory(
+            initialdir=os.path.dirname(self.resources_path),
+            title="Select New Location for Resources Folder"
+        )
+        
+        if not new_parent_dir:
+            self.logger.info("Move resources folder cancelled by user.")
+            return
+
+        current_resources_path = self.resources_path
+        new_resources_path = os.path.join(new_parent_dir, "resources")
+
+        # Prevent moving into a subdirectory of itself
+        # Convert to real paths to handle symlinks/junctions, though os.path.commonpath is usually sufficient
+        real_current_path = os.path.realpath(current_resources_path)
+        real_new_path = os.path.realpath(new_resources_path)
+        
+        if real_current_path == real_new_path:
+            messagebox.showinfo("No Change", "Resources folder is already at the selected location.")
+            self.logger.info("Resources folder already at selected location, no move needed.")
+            return
+
+        # Check if new_resources_path is a sub-path of current_resources_path
+        if os.path.commonpath([real_current_path, real_new_path]) == real_current_path:
+             messagebox.showerror("Error", "Cannot move resources folder into itself or its subdirectories.")
+             self.logger.error(f"Attempted to move resources into a subdirectory of itself: {real_new_path}")
+             return
+
+
+        if not messagebox.askyesno(
+            "Confirm Move and Restart",
+            f"Are you sure you want to move the 'resources' folder from:\n\n"
+            f"'{current_resources_path}'\n\nTO:\n\n'{new_resources_path}'\n\n"
+            f"The application will restart after the move."
+        ):
+            self.logger.info("Move resources folder cancelled by user confirmation.")
+            return
+
+        try:
+            # 1. Close all active log file handlers to release file locks
+            self._close_main_log_handlers()
+            # Note: _log_to_specific_file uses temporary handlers, so no need to close them here.
+
+            # 2. Update the path config file *before* moving the resources folder
+            # This is crucial so that the restarted app knows where to look.
+            self._save_path_config(new_parent_dir)
+            self.logger.info(f"Updated installer_path_config.json with new resources base: {new_parent_dir}")
+
+            # 3. Now, move the folder
+            shutil.move(current_resources_path, new_resources_path)
+            self.logger.info(f"Successfully moved resources folder from '{current_resources_path}' to '{new_resources_path}'.")
+            messagebox.showinfo("Move Complete", "Resources folder moved successfully. The application will now restart.")
+            self._restart_application()
+
+        except shutil.Error as e:
+            # If shutil.move fails, revert path config and re-initialize logging
+            messagebox.showerror("Move Error", f"Error moving resources folder:\n{e}\nCheck permissions or if the folder is in use.")
+            self.logger.error(f"Shutil error moving resources folder: {e}", exc_info=True)
+            # Revert path config if move failed to original parent directory
+            self._save_path_config(os.path.dirname(current_resources_path)) 
+            # Re-setup logging since handlers were closed and move failed
+            self.logger = self._setup_logging() 
+        except Exception as e:
+            # Catch other unexpected errors during the move process
+            messagebox.showerror("Unexpected Error", f"An unexpected error occurred during move:\n{e}")
+            self.logger.critical(f"Critical error during resources folder move: {e}", exc_info=True)
+            self._log_to_specific_file(logging.CRITICAL, f"Critical error during resources folder move: {e}", self.crash_log_file, exc_info=True)
+            # Revert path config if move failed
+            self._save_path_config(os.path.dirname(current_resources_path))
+            # Re-setup logging if move failed
+            self.logger = self._setup_logging()
+
+
+    def _restart_application(self):
+        """
+        Restarts the current application instance.
+        On Windows, uses a temporary batch script for robustness against file locking.
+        """
+        self.logger.info("Preparing to restart application...")
+        python_exe = sys.executable
+        current_script = os.path.abspath(sys.argv[0]) # Path to the current running .pyw script
+
+        if sys.platform == "win32":
+            # Create a temporary batch script to wait for current app to exit, then restart
+            temp_bat_path = os.path.join(tempfile.gettempdir(), "restart_installer.bat")
+            with open(temp_bat_path, "w") as f:
+                f.write(f'@echo off\n')
+                f.write(f'timeout /t 1 /nobreak > nul\n') # Wait 1 second for current app to fully close
+                f.write(f'start "" "{python_exe}" "{current_script}"\n')
+                f.write(f'del "{temp_bat_path}"\n') # Delete the temp batch file
+            subprocess.Popen(temp_bat_path, shell=True)
+        else: # For macOS/Linux (assuming a shebang or direct python execution)
+            # For .pyw like behavior, Popen without shell=True is usually preferred.
+            subprocess.Popen([python_exe, current_script])
+        
+        self.destroy() # Close the current application instance
+        sys.exit(0) # Exit the current process
+
 
     def _update_installer(self):
-        """Stub for updating the installer."""
-        self.logger.info("Attempted to update installer. (Feature not yet implemented)")
-        messagebox.showinfo("Feature Not Implemented", "Updating the installer is not yet implemented.")
+        """
+        Checks for a newer version of the installer on GitHub.
+        If a newer version is found, it downloads it and initiates a self-replacement.
+        """
+        self.logger.info("Checking for installer updates...")
+        if requests is None:
+            messagebox.showerror("Error", "The 'requests' library is not installed. Cannot check for updates.\n"
+                                 "Please install it using: pip install requests")
+            self.logger.error("Update check failed: 'requests' library not found.")
+            return
+
+        try:
+            # First, check for latest release version
+            response = requests.get(self.GITHUB_REPO_FOR_UPDATES_API, timeout=10)
+            
+            # Check specifically for 404, which means no releases found
+            if response.status_code == 404:
+                messagebox.showinfo(
+                    "Update Check",
+                    "No official releases found for the installer repository on GitHub. "
+                    "The developer may not have published any releases yet, or the repository URL is incorrect.\n\n"
+                    f"Repository API checked: {self.GITHUB_REPO_FOR_UPDATES_API.replace('/releases/latest', '')}"
+                )
+                self.logger.warning(f"Update check failed: 404 Not Found, likely no releases for {self.GITHUB_REPO_FOR_UPDATES_API}")
+                return
+
+            response.raise_for_status() # Raise for other HTTP errors (e.g., 500, permissions)
+            latest_release = response.json()
+            
+            latest_tag_name = latest_release.get("tag_name")
+            if not latest_tag_name:
+                self.logger.warning("Could not find 'tag_name' in latest GitHub release data. Response might be malformed or empty.")
+                messagebox.showinfo("Update Check", "Could not determine latest version from GitHub API response. Please check manually.")
+                return
+
+            self.logger.info(f"Latest online version: {latest_tag_name}, Current version: {self.app_version}")
+
+            # Simple string comparison for version. For robust comparison (e.g., v1.0.0 vs v1.0.10)
+            # consider installing 'packaging' library: pip install packaging
+            # from packaging.version import parse as parse_version
+            # if parse_version(latest_tag_name) > parse_version(self.app_version):
+            if latest_tag_name > self.app_version: 
+                if messagebox.askyesno(
+                    "Update Available!",
+                    f"A new version of the installer is available: {latest_tag_name}\n\n"
+                    f"Your current version: {self.app_version}\n\n"
+                    "Would you like to download and install the update now? "
+                    "The application will restart."
+                ):
+                    self._download_and_replace_installer(self.GITHUB_RAW_PYW_URL)
+                else:
+                    self.logger.info("User declined to update.")
+            else:
+                messagebox.showinfo("No Updates", f"You are running the latest version: {self.app_version}")
+                self.logger.info("No newer version found.")
+
+        except requests.exceptions.RequestException as e:
+            messagebox.showerror("Network Error", f"Could not check for updates. Please check your internet connection.\nError: {e}")
+            self.logger.error(f"Network error during update check: {e}", exc_info=True)
+        except json.JSONDecodeError:
+            messagebox.showerror("Update Error", "Could not parse update information. GitHub API response might be malformed.")
+            self.logger.error("JSON decode error during update check.", exc_info=True)
+        except Exception as e:
+            messagebox.showerror("Unexpected Error", f"An unexpected error occurred during update check:\n{e}")
+            self.logger.critical(f"Critical error during update check: {e}", exc_info=True)
+            self._log_to_specific_file(logging.CRITICAL, f"Critical error during update check: {e}", self.crash_log_file, exc_info=True)
+
+    def _download_and_replace_installer(self, download_url):
+        """
+        Downloads the new installer file and prepares for self-replacement.
+        This closes the current app and launches a helper script to do the replacement.
+        """
+        self.logger.info(f"Downloading new installer from: {download_url}")
+        try:
+            response = requests.get(download_url, stream=True, timeout=30)
+            response.raise_for_status()
+
+            # Create a temporary file to save the new installer
+            temp_dir = tempfile.mkdtemp()
+            new_installer_path = os.path.join(temp_dir, self.INSTALLER_FILENAME)
+
+            with open(new_installer_path, 'wb') as f:
+                for chunk in response.iter_content(chunk_size=8192):
+                    f.write(chunk)
+            
+            self.logger.info(f"New installer downloaded to: {new_installer_path}")
+            messagebox.showinfo("Update Downloaded", "New installer downloaded. Preparing to replace and restart.")
+
+            # Initiate the replacement script and exit
+            self._initiate_self_replacement(new_installer_path)
+
+        except requests.exceptions.RequestException as e:
+            messagebox.showerror("Download Error", f"Failed to download update: {e}")
+            self.logger.error(f"Error downloading new installer: {e}", exc_info=True)
+        except Exception as e:
+            messagebox.showerror("Update Error", f"An unexpected error occurred during update download: {e}")
+            self.logger.critical(f"Critical error during update download: {e}", exc_info=True)
+            self._log_to_specific_file(logging.CRITICAL, f"Critical error during update download: {e}", self.crash_log_file, exc_info=True)
+
+    def _initiate_self_replacement(self, new_installer_path):
+        """
+        Creates a temporary script to perform the self-replacement and restart,
+        then exits the current application.
+        """
+        current_installer_path = os.path.abspath(sys.argv[0])
+        old_installer_backup_path = current_installer_path + ".old" # For a quick backup
+
+        self.logger.info("Initiating self-replacement sequence...")
+        
+        # Ensure log handlers are closed before the replacement to avoid file locks
+        self._close_main_log_handlers()
+
+        if sys.platform == "win32":
+            temp_script_name = "updater_script.bat"
+            temp_script_path = os.path.join(tempfile.gettempdir(), temp_script_name)
+            
+            with open(temp_script_path, "w") as f:
+                f.write(f'@echo off\n')
+                f.write(f'echo Waiting for current installer to close...\n')
+                f.write(f'timeout /t 2 /nobreak > nul\n') # Wait 2 seconds for app to fully close
+                
+                f.write(f'echo Attempting to replace installer...\n')
+                # Optional: Delete old backup if it exists
+                f.write(f'if exist "{old_installer_backup_path}" del "{old_installer_backup_path}"\n')
+                # Rename current installer to .old
+                f.write(f'rename "{current_installer_path}" "{os.path.basename(old_installer_backup_path)}"\n')
+                # Move new installer to current location
+                f.write(f'move /y "{new_installer_path}" "{current_installer_path}"\n')
+                
+                f.write(f'if exist "{current_installer_path}" (\n')
+                f.write(f'    echo Update complete. Restarting installer...\n')
+                f.write(f'    start "" "{sys.executable}" "{current_installer_path}"\n')
+                f.write(f') else (\n')
+                f.write(f'    echo Error: Failed to replace installer. Check permissions.\n')
+                f.write(f'    pause\n') # Keep window open to show error
+                f.write(f')\n')
+                f.write(f'del "{temp_script_path}"\n') # Delete this batch script
+                f.write(f'exit\n') # Exit the batch script
+            
+            subprocess.Popen(temp_script_path, shell=True)
+        else:
+            # For macOS/Linux, a similar shell script or direct os.rename/shutil.move after closing
+            # would be needed. This is a simplified placeholder for non-Windows.
+            self.logger.warning("Automated self-replacement on non-Windows platforms is not fully implemented for robustness. Manual replacement may be needed.")
+            # Basic attempt for non-Windows (still risky with file locks)
+            try:
+                # Assuming handlers are already closed by previous call
+                os.rename(current_installer_path, old_installer_backup_path)
+                shutil.move(new_installer_path, current_installer_path)
+                self.logger.info("Replacement attempted. Restarting.")
+                subprocess.Popen([sys.executable, current_installer_path])
+            except Exception as e:
+                self.logger.critical(f"Critical error during non-Windows self-replacement: {e}", exc_info=True)
+                messagebox.showerror("Update Error", f"Failed to perform automated update. Please replace '{self.INSTALLER_FILENAME}' manually.\nError: {e}")
+            
+        self.destroy() # Close the current application
+        sys.exit(0) # Exit the current process
+
 
     def _open_content_viewer_window(self, file_path, title, clearable=False):
         """Opens a new Toplevel window to display file content, with an optional clear button."""
@@ -539,6 +972,7 @@ class GitHubInstallerApp(tk.Tk):
         self.developer_console_window.title("Developer Console - Live Log")
         self.developer_console_window.geometry("900x600")
         self.developer_console_window.transient(self)
+        self.developer_console_window.grab_set() # Make it modal
         self.developer_console_window.protocol("WM_DELETE_WINDOW", self._on_developer_console_close)
 
         self.developer_console_window.grid_rowconfigure(0, weight=1)
@@ -560,13 +994,8 @@ class GitHubInstallerApp(tk.Tk):
         self.logger.addHandler(self.console_log_handler)
         self.logger.info("Developer Console opened. Live logging redirected.")
 
-        # Optionally, add a simple command input for future interactive features
-        # command_frame = ttk.Frame(self.developer_console_window)
-        # command_frame.grid(row=1, column=0, sticky="ew", padx=5, pady=5)
-        # ttk.Label(command_frame, text=">>>").pack(side=tk.LEFT)
-        # command_entry = ttk.Entry(command_frame)
-        # command_entry.pack(side=tk.LEFT, fill=tk.X, expand=True)
-        # command_entry.bind("<Return>", self._execute_console_command) # Future feature
+        self.developer_console_window.wait_window(self.developer_console_window)
+
 
     def _append_to_developer_console(self, message):
         """Appends a message to the developer console's text widget."""
