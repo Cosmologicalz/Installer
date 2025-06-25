@@ -42,7 +42,7 @@ class GitHubInstallerApp(tk.Tk):
     DEFAULT_APP_VERSION = "v0.3.1" # Updated default version for extraction feature
     GITHUB_REPO_FOR_UPDATES_API = "https://api.github.com/repos/Cosmologicalz/Installer/releases/latest"
     # Direct raw content link for the .pyw file (assuming main branch always has the latest for this repo)
-    GITHUB_RAW_PYW_URL = "https://raw.githubusercontent.com/Cosmologicalz/Installer/main/Installer.pyw"
+    GITHUB_RAW_PYW_URL = "https://raw.githubusercontent.com/Cosmologicalz/Installer/refs/heads/main/installer.pyw"
     INSTALLER_FILENAME = os.path.basename(sys.argv[0]) # Name of the current .pyw file
 
     def __init__(self):
