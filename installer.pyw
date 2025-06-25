@@ -1,13 +1,19 @@
 import tkinter as tk
-from tkinter import ttk, filedialog, scrolledtext, messagebox
+from tkinter import ttk, filedialog, scrolledtext, messagebox, Toplevel
 import os
 import json
 import logging
 from logging.handlers import RotatingFileHandler
 from datetime import datetime
 import sys
-import subprocess # For opening interactive shell (stubbed for now)
-import threading # For background tasks like live logging update
+import subprocess # For opening files in default editor
+
+# Ensure Pillow is available for dummy icon generation
+try:
+    from PIL import Image, ImageDraw
+except ImportError:
+    print("Pillow not found. Install it with 'pip install Pillow' to generate a dummy icon if 'icon.png' is missing.")
+    print("The app will run, but may not display an icon without 'Pillow' or 'icon.png'.")
 
 
 class GitHubInstallerApp(tk.Tk):
@@ -21,9 +27,6 @@ class GitHubInstallerApp(tk.Tk):
 
     def __init__(self):
         super().__init__()
-        self.title("GitHub Repo Installer")
-        self.geometry("800x600")
-        self.iconphoto(False, tk.PhotoImage(file=self._get_resource_path("icon.png"))) # Placeholder icon
 
         self.resources_path = self._get_resource_path("resources")
         self.log_file = os.path.join(self.resources_path, "log.log")
@@ -35,11 +38,28 @@ class GitHubInstallerApp(tk.Tk):
         self.logger = self._setup_logging()
         self._startup_checks()
 
-        self._setup_ui()
-        self._load_app_state()
+        self.app_version = self._load_version() # Load version before UI setup
+        self.title(f"GitHub Repo Installer - {self.app_version}")
+        self.geometry("800x600")
 
-        self.logger.info("Application started successfully.")
+        # Handle icon.png (create dummy if not exists, then load)
+        icon_path = self._get_resource_path("icon.png")
+        if not os.path.exists(icon_path):
+            self._create_dummy_icon(icon_path)
+        try:
+            self.iconphoto(False, tk.PhotoImage(file=icon_path))
+        except tk.TclError:
+            self.logger.warning(f"Could not load icon from {icon_path}. Ensure it's a valid PNG.")
+
+
+        self._setup_ui()
+        self._load_app_state() # Load other app state after UI is ready
+
+        self.logger.info(f"Application started successfully. Version: {self.app_version}")
         self.protocol("WM_DELETE_WINDOW", self._on_closing)
+
+        # Developer console window reference
+        self.developer_console_window = None
 
     def _get_resource_path(self, relative_path):
         """
@@ -53,6 +73,17 @@ class GitHubInstallerApp(tk.Tk):
             base_path = os.path.abspath(".")
         return os.path.join(base_path, relative_path)
 
+    def _create_dummy_icon(self, path):
+        """Creates a dummy icon.png if it doesn't exist, using Pillow."""
+        try:
+            img = Image.new('RGB', (32, 32), color=(73, 109, 137))
+            d = ImageDraw.Draw(img)
+            d.text((8, 5), "G", fill=(255, 255, 255), font_size=20) # Use font_size for better scaling
+            img.save(path)
+            self.logger.info(f"Created dummy icon.png at {path}")
+        except Exception as e:
+            self.logger.warning(f"Failed to create dummy icon.png: {e}. Please ensure Pillow is installed.")
+
     def _setup_logging(self):
         """
         Sets up the custom logging system for the application,
@@ -61,39 +92,43 @@ class GitHubInstallerApp(tk.Tk):
         logger = logging.getLogger("GitHubInstaller")
         logger.setLevel(logging.DEBUG)
 
-        # Ensure handlers are not duplicated on re-init
-        if not logger.handlers:
-            # Custom formatter
-            formatter = logging.Formatter(
-                fmt="[%(asctime)s][%(levelname)s] --- %(message)s --- [%(filename)s - %(funcName)s - %(lineno)d]",
-                datefmt="%H:%M:%S"
-            )
+        # Clear existing handlers to prevent duplicates on potential re-init
+        for handler in list(logger.handlers):
+            logger.removeHandler(handler)
 
-            # File handler for log.log (general log)
-            file_handler = RotatingFileHandler(self.log_file, maxBytes=10*1024*1024, backupCount=5)
-            file_handler.setFormatter(formatter)
-            logger.addHandler(file_handler)
+        # Custom formatter for file and console
+        formatter = logging.Formatter(
+            fmt="[%(asctime)s][%(levelname)s] --- %(message)s --- [%(filename)s - %(funcName)s - %(lineno)d]",
+            datefmt="%H:%M:%S"
+        )
+        # Formatter for GUI (simpler, without full context)
+        gui_formatter = logging.Formatter("[%(asctime)s][%(levelname)s] %(message)s", datefmt="%H:%M:%S")
 
-            # Console handler (for debugging in console if not .pyw)
-            console_handler = logging.StreamHandler(sys.stdout)
-            console_handler.setFormatter(formatter)
-            logger.addHandler(console_handler)
+        # File handler for log.log (general log)
+        file_handler = RotatingFileHandler(self.log_file, maxBytes=10*1024*1024, backupCount=5)
+        file_handler.setFormatter(formatter)
+        logger.addHandler(file_handler)
 
-            # Custom handler for GUI text widget
-            self.log_text_handler = GUILogHandler(self)
-            self.log_text_handler.setFormatter(logging.Formatter("[%(asctime)s][%(levelname)s] %(message)s", datefmt="%H:%M:%S"))
-            logger.addHandler(self.log_text_handler)
+        # Console handler (for debugging if run as .py)
+        console_handler = logging.StreamHandler(sys.stdout)
+        console_handler.setFormatter(formatter)
+        logger.addHandler(console_handler)
+
+        # Custom handler for main GUI text widget
+        self.main_gui_log_handler = GUILogHandler(self, lambda msg: self.after(0, self._append_to_log_display, msg))
+        self.main_gui_log_handler.setFormatter(gui_formatter)
+        logger.addHandler(self.main_gui_log_handler)
 
         return logger
 
     def _log_to_specific_file(self, level, message, filename, exc_info=None):
         """
         Logs a message to a specific log file in addition to the main log.
+        This uses a separate logger to avoid issues with main logger's handlers.
         """
-        # Create a separate logger for this file to avoid conflicts with main logger's handlers
-        specific_logger = logging.getLogger(f"SpecificLogger_{filename}")
+        specific_logger = logging.getLogger(f"SpecificLogger_{os.path.basename(filename)}")
         specific_logger.setLevel(logging.DEBUG)
-        if not specific_logger.handlers:
+        if not specific_logger.handlers: # Only add handler once
             file_handler = RotatingFileHandler(filename, maxBytes=10*1024*1024, backupCount=5)
             formatter = logging.Formatter(
                 fmt="[%(asctime)s][%(levelname)s] --- %(message)s --- [%(filename)s - %(funcName)s - %(lineno)d]",
@@ -123,6 +158,13 @@ class GitHubInstallerApp(tk.Tk):
                 os.makedirs(self.resources_path)
                 self.logger.info(f"Created resources folder: {self.resources_path}")
 
+            # Ensure data.json exists first to load version
+            if not os.path.exists(self.data_json_file):
+                with open(self.data_json_file, "w") as f:
+                    json.dump({"github_history": [], "download_dir": os.getcwd(), "current_version": "v0.1-pre-alpha"}, f, indent=4)
+                self.logger.info(f"Created missing data.json file: {os.path.basename(self.data_json_file)}")
+
+            # Now, check and create log files
             required_files = {
                 self.log_file: "[TIMESTAMP] --- Application Session Start ---",
                 self.his_log_file: "[TIMESTAMP] --- History Log Start ---",
@@ -136,11 +178,6 @@ class GitHubInstallerApp(tk.Tk):
                         f.write(f"\n{datetime.now().strftime('%Y-%m-%d %H:%M:%S')} {header_content}\n")
                     self.logger.info(f"Created missing log file: {os.path.basename(file_path)}")
 
-            if not os.path.exists(self.data_json_file):
-                with open(self.data_json_file, "w") as f:
-                    json.dump({"github_history": [], "download_dir": os.getcwd()}, f, indent=4)
-                self.logger.info(f"Created missing data.json file: {os.path.basename(self.data_json_file)}")
-
             self.logger.info("Startup checks complete. All resources are ready.")
 
             # Append session start header to log.log
@@ -152,6 +189,32 @@ class GitHubInstallerApp(tk.Tk):
             self._log_to_specific_file(logging.CRITICAL, f"Fatal error during startup checks: {e}", self.crash_log_file, exc_info=True)
             messagebox.showerror("Critical Error", f"The application encountered a fatal error during startup and cannot proceed:\n{e}\nCheck crash.log for details.")
             self.destroy() # Close the application if critical files can't be set up
+
+    def _load_version(self):
+        """Loads the current version from data.json."""
+        try:
+            with open(self.data_json_file, "r") as f:
+                data = json.load(f)
+                version = data.get("current_version", "vUnknown")
+                self.logger.info(f"Loaded application version: {version}")
+                return version
+        except (FileNotFoundError, json.JSONDecodeError):
+            self.logger.warning("data.json not found or corrupted during version load. Defaulting to v0.1-pre-alpha.")
+            return "v0.1-pre-alpha"
+
+    def _save_version(self):
+        """Saves the current version to data.json."""
+        try:
+            with open(self.data_json_file, "r+") as f:
+                data = json.load(f)
+                data["current_version"] = self.app_version
+                f.seek(0) # Rewind to beginning
+                json.dump(data, f, indent=4)
+                f.truncate() # Trim any remaining old content
+            self.logger.debug(f"Saved application version: {self.app_version}")
+        except Exception as e:
+            self.logger.error(f"Error saving application version to data.json: {e}", exc_info=True)
+
 
     def _setup_ui(self):
         """
@@ -196,17 +259,17 @@ class GitHubInstallerApp(tk.Tk):
         # Handle Files Menu
         handle_files_menu = tk.Menu(options_menu, tearoff=0)
         options_menu.add_cascade(label="Handle Files", menu=handle_files_menu)
-        handle_files_menu.add_command(label="GitHub Links (data.json)", command=lambda: self._open_file_in_editor(self.data_json_file))
-        handle_files_menu.add_command(label="General Logs (log.log)", command=lambda: self._open_file_in_editor(self.log_file))
-        handle_files_menu.add_command(label="Download History (dow.log)", command=lambda: self._open_file_in_editor(self.dow_log_file))
-        handle_files_menu.add_command(label="Crash History (his.log)", command=lambda: self._open_file_in_editor(self.his_log_file))
-        handle_files_menu.add_command(label="Fatal Crash Logs (crash.log)", command=lambda: self._open_file_in_editor(self.crash_log_file))
+        handle_files_menu.add_command(label="GitHub Links (data.json)", command=lambda: self._open_content_viewer_window(self.data_json_file, "data.json Content", clearable=False))
+        handle_files_menu.add_command(label="General Logs (log.log)", command=lambda: self._open_content_viewer_window(self.log_file, "General Logs (log.log)", clearable=True))
+        handle_files_menu.add_command(label="Download History (dow.log)", command=lambda: self._open_content_viewer_window(self.dow_log_file, "Download History (dow.log)", clearable=True))
+        handle_files_menu.add_command(label="Crash History (his.log)", command=lambda: self._open_content_viewer_window(self.his_log_file, "Crash History (his.log)", clearable=True))
+        handle_files_menu.add_command(label="Fatal Crash Logs (crash.log)", command=lambda: self._open_content_viewer_window(self.crash_log_file, "Fatal Crash Logs (crash.log)", clearable=True))
 
 
         # Developer Tools Menu
         dev_tools_menu = tk.Menu(menubar, tearoff=0)
         menubar.add_cascade(label="Developer Tools", menu=dev_tools_menu)
-        dev_tools_menu.add_command(label="Open Python Interactive Shell", command=self._open_interactive_shell)
+        dev_tools_menu.add_command(label="Open Developer Console", command=self._open_developer_console)
         dev_tools_menu.add_command(label="Clear Live Log", command=self._clear_live_log)
 
         # --- GitHub Input Frame ---
@@ -258,18 +321,18 @@ class GitHubInstallerApp(tk.Tk):
         self.log_text_widget.grid(row=0, column=0, sticky="nsew", padx=5, pady=5)
 
     def _append_to_log_display(self, message):
-        """Appends a message to the live log ScrolledText widget."""
+        """Appends a message to the main window's live log ScrolledText widget."""
         self.log_text_widget.configure(state="normal")
         self.log_text_widget.insert(tk.END, message + "\n")
         self.log_text_widget.see(tk.END) # Auto-scroll to bottom
         self.log_text_widget.configure(state="disabled")
 
     def _clear_live_log(self):
-        """Clears the content of the live log display."""
+        """Clears the content of the main window's live log display."""
         self.log_text_widget.configure(state="normal")
         self.log_text_widget.delete(1.0, tk.END)
         self.log_text_widget.configure(state="disabled")
-        self.logger.info("Live log display cleared.")
+        self.logger.info("Main live log display cleared.")
 
     def _browse_download_directory(self):
         """Opens a directory chooser dialog and updates the download directory."""
@@ -306,12 +369,14 @@ class GitHubInstallerApp(tk.Tk):
                 self.create_folder_on_extract_var.set(data.get("create_folder_on_extract", True))
                 self.delete_zip_after_extract_var.set(data.get("delete_zip_after_extract", False))
 
+                # Note: App version is loaded separately by _load_version()
+
                 self.logger.info("Application state loaded.")
         except FileNotFoundError:
-            self.logger.warning("data.json not found. Initializing with default state.")
+            self.logger.warning("data.json not found during app state load. Initializing with default state.")
             self._save_app_state() # Create a new one
         except json.JSONDecodeError:
-            self.logger.error("Error decoding data.json. File might be corrupted. Initializing with default state.", exc_info=True)
+            self.logger.error("Error decoding data.json during app state load. File might be corrupted. Initializing with default state.", exc_info=True)
             self._log_to_specific_file(logging.ERROR, "Error decoding data.json. File might be corrupted.", self.crash_log_file, exc_info=True)
             self._save_app_state() # Overwrite corrupted file
         except Exception as e:
@@ -342,6 +407,7 @@ class GitHubInstallerApp(tk.Tk):
                 "extract_on_download": self.extract_on_download_var.get(),
                 "create_folder_on_extract": self.create_folder_on_extract_var.get(),
                 "delete_zip_after_extract": self.delete_zip_after_extract_var.get(),
+                "current_version": self.app_version # Save the current version
             }
             with open(self.data_json_file, "w") as f:
                 json.dump(app_state, f, indent=4)
@@ -395,30 +461,129 @@ class GitHubInstallerApp(tk.Tk):
         self.logger.info("Attempted to update installer. (Feature not yet implemented)")
         messagebox.showinfo("Feature Not Implemented", "Updating the installer is not yet implemented.")
 
-    def _open_file_in_editor(self, file_path):
-        """Attempts to open a given file in the default system editor."""
-        try:
-            if sys.platform == "win32":
-                os.startfile(file_path)
-            elif sys.platform == "darwin": # macOS
-                subprocess.run(["open", file_path])
-            else: # Linux/other
-                subprocess.run(["xdg-open", file_path])
-            self.logger.info(f"Opened file in default editor: {file_path}")
-        except FileNotFoundError:
-            self.logger.error(f"Could not find default editor for file: {file_path}", exc_info=True)
-            messagebox.showerror("Error", f"Could not find an application to open {os.path.basename(file_path)}.")
-        except Exception as e:
-            self.logger.error(f"Error opening file {file_path}: {e}", exc_info=True)
-            messagebox.showerror("Error", f"An error occurred while trying to open {os.path.basename(file_path)}:\n{e}")
+    def _open_content_viewer_window(self, file_path, title, clearable=False):
+        """Opens a new Toplevel window to display file content, with an optional clear button."""
+        viewer_window = Toplevel(self)
+        viewer_window.title(title)
+        viewer_window.geometry("700x500")
+        viewer_window.transient(self) # Make it appear on top of the main window
+        viewer_window.grab_set() # Make it modal (user must interact with it)
+        viewer_window.protocol("WM_DELETE_WINDOW", viewer_window.destroy)
 
-    def _open_interactive_shell(self):
-        """Stub for opening a Python interactive shell."""
-        self.logger.info("Attempted to open Python interactive shell. (Feature not yet fully implemented directly within pyw)")
-        messagebox.showinfo("Feature Not Implemented", "Opening an interactive Python shell directly from a .pyw application is complex and not fully implemented yet.")
-        self.logger.warning("For debugging, consider running this script as a .py file from a terminal.")
-        # Actual implementation would likely involve starting a new process with a console,
-        # which is tricky for .pyw which runs without a console.
+        # Configure grid for responsiveness
+        viewer_window.grid_rowconfigure(0, weight=1)
+        viewer_window.grid_columnconfigure(0, weight=1)
+
+        text_widget = scrolledtext.ScrolledText(
+            viewer_window,
+            wrap=tk.WORD,
+            state="disabled",
+            font=("Consolas", 10),
+            padx=10, pady=10
+        )
+        text_widget.grid(row=0, column=0, sticky="nsew")
+
+        try:
+            with open(file_path, "r") as f:
+                content = f.read()
+            text_widget.configure(state="normal")
+            text_widget.insert(tk.END, content)
+            text_widget.see(tk.END)
+            text_widget.configure(state="disabled")
+            self.logger.info(f"Opened file '{os.path.basename(file_path)}' in new viewer window.")
+        except FileNotFoundError:
+            messagebox.showerror("Error", f"File not found: {file_path}")
+            text_widget.configure(state="normal")
+            text_widget.insert(tk.END, f"Error: File not found at {file_path}")
+            text_widget.configure(state="disabled")
+            self.logger.error(f"File not found for viewer: {file_path}", exc_info=True)
+        except Exception as e:
+            messagebox.showerror("Error", f"Could not read file: {file_path}\n{e}")
+            text_widget.configure(state="normal")
+            text_widget.insert(tk.END, f"Error reading file: {e}")
+            text_widget.configure(state="disabled")
+            self.logger.error(f"Error reading file for viewer {file_path}: {e}", exc_info=True)
+
+        if clearable:
+            clear_button_frame = ttk.Frame(viewer_window)
+            clear_button_frame.grid(row=1, column=0, pady=5)
+            clear_button = ttk.Button(clear_button_frame, text="Clear Log", command=lambda: self._clear_log_file(file_path, text_widget))
+            clear_button.pack()
+
+        viewer_window.wait_window(viewer_window) # Wait for this window to close
+
+    def _clear_log_file(self, file_path, text_widget):
+        """Clears the content of a log file and updates the associated text widget."""
+        if messagebox.askyesno("Clear Log", f"Are you sure you want to clear '{os.path.basename(file_path)}'? This action cannot be undone."):
+            try:
+                with open(file_path, "w") as f:
+                    f.write(f"{datetime.now().strftime('%Y-%m-%d %H:%M:%S')} --- Log Cleared ---\n")
+                
+                text_widget.configure(state="normal")
+                text_widget.delete(1.0, tk.END)
+                text_widget.insert(tk.END, f"{datetime.now().strftime('%Y-%m-%d %H:%M:%S')} --- Log Cleared ---\n")
+                text_widget.configure(state="disabled")
+                self.logger.info(f"Cleared log file: {os.path.basename(file_path)}")
+                self._log_to_specific_file(logging.INFO, f"Log file cleared.", file_path) # Log this action to the cleared file itself.
+            except Exception as e:
+                messagebox.showerror("Error", f"Could not clear log file: {file_path}\n{e}")
+                self.logger.error(f"Error clearing log file {file_path}: {e}", exc_info=True)
+
+    def _open_developer_console(self):
+        """Opens a new Toplevel window for developer console with live log."""
+        if self.developer_console_window and self.developer_console_window.winfo_exists():
+            self.developer_console_window.focus_set()
+            return
+
+        self.developer_console_window = Toplevel(self)
+        self.developer_console_window.title("Developer Console - Live Log")
+        self.developer_console_window.geometry("900x600")
+        self.developer_console_window.transient(self)
+        self.developer_console_window.protocol("WM_DELETE_WINDOW", self._on_developer_console_close)
+
+        self.developer_console_window.grid_rowconfigure(0, weight=1)
+        self.developer_console_window.grid_columnconfigure(0, weight=1)
+
+        self.developer_console_text = scrolledtext.ScrolledText(
+            self.developer_console_window,
+            wrap=tk.WORD,
+            state="disabled",
+            font=("Consolas", 9),
+            padx=5, pady=5
+        )
+        self.developer_console_text.grid(row=0, column=0, sticky="nsew")
+
+        # Add a new GUI log handler specifically for this console
+        self.console_log_handler = GUILogHandler(self, lambda msg: self.after(0, self._append_to_developer_console, msg))
+        # Use the same formatter as main GUI log for simplicity in the console
+        self.console_log_handler.setFormatter(logging.Formatter("[%(asctime)s][%(levelname)s] %(message)s", datefmt="%H:%M:%S"))
+        self.logger.addHandler(self.console_log_handler)
+        self.logger.info("Developer Console opened. Live logging redirected.")
+
+        # Optionally, add a simple command input for future interactive features
+        # command_frame = ttk.Frame(self.developer_console_window)
+        # command_frame.grid(row=1, column=0, sticky="ew", padx=5, pady=5)
+        # ttk.Label(command_frame, text=">>>").pack(side=tk.LEFT)
+        # command_entry = ttk.Entry(command_frame)
+        # command_entry.pack(side=tk.LEFT, fill=tk.X, expand=True)
+        # command_entry.bind("<Return>", self._execute_console_command) # Future feature
+
+    def _append_to_developer_console(self, message):
+        """Appends a message to the developer console's text widget."""
+        if self.developer_console_text and self.developer_console_text.winfo_exists():
+            self.developer_console_text.configure(state="normal")
+            self.developer_console_text.insert(tk.END, message + "\n")
+            self.developer_console_text.see(tk.END)
+            self.developer_console_text.configure(state="disabled")
+
+    def _on_developer_console_close(self):
+        """Removes the console's log handler when the developer console is closed."""
+        self.logger.info("Developer Console closed. Removing its log handler.")
+        if hasattr(self, 'console_log_handler') and self.console_log_handler in self.logger.handlers:
+            self.logger.removeHandler(self.console_log_handler)
+        self.developer_console_window.destroy()
+        self.developer_console_window = None # Clear reference
+
 
     def _on_closing(self):
         """Handles application shutdown, saving state and logging exit."""
@@ -432,33 +597,19 @@ class GitHubInstallerApp(tk.Tk):
 class GUILogHandler(logging.Handler):
     """
     A custom logging handler that sends log records to a Tkinter ScrolledText widget.
+    Takes a callback function for thread-safe GUI updates.
     """
-    def __init__(self, app_instance):
+    def __init__(self, app_instance, append_callback):
         super().__init__()
         self.app = app_instance
+        self.append_callback = append_callback # Callback to update the GUI widget
 
     def emit(self, record):
         log_entry = self.format(record)
-        # Use after() to ensure thread-safe GUI updates if logging from other threads
-        self.app.after(0, self.app._append_to_log_display, log_entry)
+        # Use the provided callback for thread-safe GUI updates
+        self.append_callback(log_entry)
 
 
 if __name__ == "__main__":
-    # Ensure there's a placeholder icon.png if running standalone for testing
-    # In a real PyInstaller build, you'd include this resource.
-    icon_path = os.path.join(os.path.abspath("."), "icon.png")
-    if not os.path.exists(icon_path):
-        try:
-            from PIL import Image, ImageDraw # Pillow library for creating a dummy image
-            img = Image.new('RGB', (32, 32), color = (73, 109, 137))
-            d = ImageDraw.Draw(img)
-            d.text((10,10), "G", fill=(255,255,255))
-            img.save(icon_path)
-        except ImportError:
-            print("Pillow not found. Install it with 'pip install Pillow' to generate a dummy icon.")
-            print("Using a placeholder if icon.png is missing. The app will still run.")
-        except Exception as e:
-            print(f"Could not create dummy icon.png: {e}")
-
     app = GitHubInstallerApp()
     app.mainloop()
