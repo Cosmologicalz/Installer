@@ -10,13 +10,15 @@ import subprocess # For opening files in default editor and running restart scri
 import shutil # For moving directories
 import time # For delays in restart scripts
 import tempfile # For temporary files/directories during update
+import threading # For running download in background
+import zipfile # For extracting zip files
 
 # Try to import requests for GitHub API interaction. If not found, notify user.
 try:
     import requests
 except ImportError:
     requests = None
-    print("Warning: 'requests' library not found. Update Installer feature will be unavailable.")
+    print("Warning: 'requests' library not found. Update/Download features will be unavailable.")
 
 # Ensure Pillow is available for dummy icon generation
 try:
@@ -37,10 +39,10 @@ class GitHubInstallerApp(tk.Tk):
     installation features.
     """
 
-    DEFAULT_APP_VERSION = "v0.2.4-pre-alpha" # Updated default version
+    DEFAULT_APP_VERSION = "v0.3.1" # Updated default version for extraction feature
     GITHUB_REPO_FOR_UPDATES_API = "https://api.github.com/repos/Cosmologicalz/Installer/releases/latest"
     # Direct raw content link for the .pyw file (assuming main branch always has the latest for this repo)
-    GITHUB_RAW_PYW_URL = "https://raw.githubusercontent.com/Cosmologicalz/Installer/refs/heads/main/installer.pyw"
+    GITHUB_RAW_PYW_URL = "https://raw.githubusercontent.com/Cosmologicalz/Installer/main/Installer.pyw"
     INSTALLER_FILENAME = os.path.basename(sys.argv[0]) # Name of the current .pyw file
 
     def __init__(self):
@@ -288,7 +290,7 @@ class GitHubInstallerApp(tk.Tk):
         """
         self.logger.info("Performing startup checks...")
         try:
-            # Ensure data.json exists first to handle version loading
+            # data.json handled here, resources folder assumed to exist from __init__
             if not os.path.exists(self.data_json_file):
                 with open(self.data_json_file, "w") as f:
                     json.dump({"github_history": [], "download_dir": os.getcwd(), "current_version": self.DEFAULT_APP_VERSION}, f, indent=4)
@@ -397,6 +399,7 @@ class GitHubInstallerApp(tk.Tk):
         self.grid_rowconfigure(1, weight=0) # GitHub input row
         self.grid_rowconfigure(2, weight=0) # Quick options row
         self.grid_rowconfigure(3, weight=1) # Log display row
+        self.grid_rowconfigure(4, weight=0) # Status bar row
         self.grid_columnconfigure(0, weight=1) # Main column
 
         # --- Menu Bar ---
@@ -491,6 +494,26 @@ class GitHubInstallerApp(tk.Tk):
             font=("Consolas", 10)
         )
         self.log_text_widget.grid(row=0, column=0, sticky="nsew", padx=5, pady=5)
+
+        # --- Status Bar ---
+        status_frame = ttk.Frame(self, padding="5")
+        status_frame.grid(row=4, column=0, padx=10, pady=5, sticky="ew")
+        status_frame.grid_columnconfigure(0, weight=1) # Progress bar takes most space
+
+        self.progress_var = tk.DoubleVar(value=0)
+        self.progressbar = ttk.Progressbar(
+            status_frame,
+            orient="horizontal",
+            length=500,
+            mode="determinate",
+            variable=self.progress_var
+        )
+        self.progressbar.grid(row=0, column=0, sticky="ew", padx=5, pady=2)
+
+        self.status_text_var = tk.StringVar(value="Ready")
+        self.status_label = ttk.Label(status_frame, textvariable=self.status_text_var)
+        self.status_label.grid(row=0, column=1, padx=5, pady=2, sticky="e")
+
 
     def _append_to_log_display(self, message):
         """Appends a message to the main window's live log ScrolledText widget."""
@@ -601,7 +624,9 @@ class GitHubInstallerApp(tk.Tk):
         self.logger.debug(f"GitHub URL selected from history: {selected_url}")
 
     def _start_download_process(self):
-        """Initiates the GitHub content download and installation process."""
+        """
+        Initiates the GitHub content download and installation process in a separate thread.
+        """
         repo_url = self.github_url_var.get()
         download_dir = self.download_dir_var.get()
         self._save_app_state() # Save the current URL to history
@@ -616,17 +641,202 @@ class GitHubInstallerApp(tk.Tk):
             self.logger.error(f"Download attempt failed: Invalid download directory '{download_dir}'.")
             return
 
-        self.logger.info(f"Attempting to download from GitHub: {repo_url}")
-        self.logger.info(f"Target download directory: {download_dir}")
-        self._log_to_specific_file(logging.INFO, f"Download initiated: {repo_url} to {download_dir}", self.dow_log_file)
+        self.status_text_var.set("Fetching release info...")
+        self.progressbar.config(mode="indeterminate")
+        self.progressbar.start()
 
-        # Placeholder for actual download and installation logic
-        messagebox.showinfo("Download Initiated",
-                            f"Download process for '{repo_url}' initiated to '{download_dir}'.\n"
-                            "This feature is under development. See live log for progress.")
-        self.logger.info("Download/Installation feature is a placeholder. No actual download occurred.")
-        self.logger.debug(f"Quick Options: Extract={self.extract_on_download_var.get()}, CreateFolder={self.create_folder_on_extract_var.get()}, DeleteZIP={self.delete_zip_after_extract_var.get()}")
+        # Run the actual download logic in a separate thread
+        download_thread = threading.Thread(target=self._perform_download_logic, args=(repo_url, download_dir))
+        download_thread.daemon = True # Allow the main program to exit even if thread is running
+        download_thread.start()
 
+
+    def _perform_download_logic(self, repo_url, download_dir):
+        """
+        The actual logic for fetching release info and downloading, run in a separate thread.
+        """
+        try:
+            repo_api_url = repo_url.replace("https://github.com/", "https://api.github.com/repos/")
+            # Remove trailing slash if present, then add /releases/latest
+            if repo_api_url.endswith('/'):
+                repo_api_url = repo_api_url[:-1]
+            repo_api_url += "/releases/latest"
+
+            self.logger.info(f"Fetching latest release info from API: {repo_api_url}")
+            self.status_text_var.set("Fetching release data...")
+
+            if requests is None:
+                self.after(0, lambda: messagebox.showerror("Error", "The 'requests' library is not installed. Cannot download content.\n"
+                                     "Please install it using: pip install requests"))
+                self.logger.error("Download failed: 'requests' library not found.")
+                self.after(0, self._reset_status_bar)
+                return
+
+            response = requests.get(repo_api_url, timeout=15)
+            
+            if response.status_code == 404:
+                self.after(0, lambda: messagebox.showerror("Download Error", f"Repository not found or no releases for: {repo_url}"))
+                self.logger.error(f"Download failed: 404 Not Found for releases API: {repo_api_url}")
+                self.after(0, self._reset_status_bar)
+                return
+            
+            response.raise_for_status() # Raise for other HTTP errors
+            release_data = response.json()
+
+            download_url = None
+            suggested_filename = None
+
+            # Prioritize zipball_url (source code zip)
+            if "zipball_url" in release_data:
+                download_url = release_data["zipball_url"]
+                # GitHub zipball URL format is like /repos/user/repo/zipball/tag_name
+                # We can derive a filename from the repo name and tag.
+                repo_name = repo_url.split('/')[-1]
+                tag_name = release_data.get("tag_name", "latest").replace("v", "") # Remove 'v' prefix if present
+                suggested_filename = f"{repo_name}-{tag_name}.zip"
+                self.logger.info(f"Found zipball URL: {download_url}")
+            else:
+                # Look for a .zip asset in the assets list
+                self.logger.info("zipball_url not found. Checking assets for .zip files.")
+                for asset in release_data.get("assets", []):
+                    if asset.get("name", "").endswith(".zip"):
+                        download_url = asset["browser_download_url"]
+                        suggested_filename = asset["name"]
+                        self.logger.info(f"Found .zip asset: {suggested_filename} at {download_url}")
+                        break
+            
+            if not download_url:
+                self.after(0, lambda: messagebox.showerror("Download Error", "No suitable .zip release or asset found for the given repository."))
+                self.logger.error(f"No suitable .zip file found for repository: {repo_url}")
+                self.after(0, self._reset_status_bar)
+                return
+
+            destination_path = os.path.join(download_dir, suggested_filename)
+            self.logger.info(f"Starting download of {suggested_filename} to {destination_path}")
+            self.status_text_var.set(f"Downloading {suggested_filename}...")
+            self.progressbar.config(mode="determinate") # Switch to determinate mode
+
+            self._download_file(download_url, destination_path, self._update_download_progress)
+            
+            self.logger.info(f"Successfully downloaded {suggested_filename}.")
+            self._log_to_specific_file(logging.INFO, f"Downloaded: {suggested_filename}", self.dow_log_file)
+            self.after(0, lambda: messagebox.showinfo("Download Complete", f"Successfully downloaded {suggested_filename} to:\n{download_dir}"))
+            
+            # --- Extraction Logic ---
+            if self.extract_on_download_var.get():
+                self.logger.info(f"Attempting to extract {suggested_filename}.")
+                self.status_text_var.set("Extracting...")
+                self.progressbar.config(mode="indeterminate")
+                self.progressbar.start()
+
+                # Determine extraction destination based on 'create_folder_on_extract'
+                if self.create_folder_on_extract_var.get():
+                    extract_folder_name = os.path.splitext(suggested_filename)[0] # Remove .zip
+                    final_extract_path = os.path.join(download_dir, extract_folder_name)
+                    self.logger.info(f"Creating extraction folder: {final_extract_path}")
+                    os.makedirs(final_extract_path, exist_ok=True)
+                else:
+                    final_extract_path = download_dir
+                
+                self._extract_zip(destination_path, final_extract_path)
+
+                # --- Delete ZIP after extraction ---
+                if self.delete_zip_after_extract_var.get():
+                    try:
+                        os.remove(destination_path)
+                        self.logger.info(f"Deleted downloaded ZIP file: {destination_path}")
+                    except Exception as delete_e:
+                        self.logger.error(f"Failed to delete ZIP file {destination_path}: {delete_e}", exc_info=True)
+                        self.after(0, lambda: messagebox.showwarning("Cleanup Warning", f"Failed to delete downloaded ZIP file:\n{destination_path}\nError: {delete_e}"))
+
+            self.after(0, self._reset_status_bar)
+            self.logger.info("Extraction/Installation logic not yet implemented for downloaded content.")
+            # Only show this if extraction was NOT done or if there's more to do
+            # self.after(0, lambda: messagebox.showinfo("Next Step", "Download complete. Extraction and installation features are coming soon!"))
+
+
+        except requests.exceptions.RequestException as e:
+            self.after(0, lambda: messagebox.showerror("Network Error", f"Could not fetch release info or download file.\nError: {e}"))
+            self.logger.error(f"Network error during download logic: {e}", exc_info=True)
+            self._log_to_specific_file(logging.ERROR, f"Download failed (network error): {e}", self.crash_log_file, exc_info=True)
+            self.after(0, self._reset_status_bar)
+        except json.JSONDecodeError:
+            self.after(0, lambda: messagebox.showerror("Download Error", "Could not parse GitHub API response. Repository information might be malformed."))
+            self.logger.error("JSON decode error during release info fetch.", exc_info=True)
+            self._log_to_specific_file(logging.ERROR, "Download failed (JSON parse error).", self.crash_log_file, exc_info=True)
+            self.after(0, self._reset_status_bar)
+        except Exception as e:
+            self.after(0, lambda: messagebox.showerror("Unexpected Download Error", f"An unexpected error occurred during download process:\n{e}"))
+            self.logger.critical(f"Critical error in download logic: {e}", exc_info=True)
+            self._log_to_specific_file(logging.CRITICAL, f"Critical error during download: {e}", self.crash_log_file, exc_info=True)
+            self.after(0, self._reset_status_bar)
+
+
+    def _download_file(self, url, destination_path, progress_callback):
+        """
+        Downloads a file from a URL to a destination path, providing progress updates.
+        """
+        self.logger.debug(f"Initiating file download: {url} to {destination_path}")
+        try:
+            with requests.get(url, stream=True, timeout=60) as r:
+                r.raise_for_status() # Raise HTTPError for bad responses (4xx or 5xx)
+                total_size = int(r.headers.get('content-length', 0))
+                downloaded_size = 0
+
+                with open(destination_path, 'wb') as f:
+                    for chunk in r.iter_content(chunk_size=8192):
+                        if chunk: # filter out keep-alive new chunks
+                            f.write(chunk)
+                            downloaded_size += len(chunk)
+                            if total_size > 0:
+                                progress = (downloaded_size / total_size) * 100
+                                # Use after() to update GUI from different thread
+                                self.after(0, progress_callback, progress, downloaded_size, total_size)
+            self.logger.debug(f"File download complete: {destination_path}")
+        except Exception as e:
+            self.logger.error(f"Error during file download: {e}", exc_info=True)
+            raise # Re-raise to be caught by _perform_download_logic's outer try/except
+
+    def _update_download_progress(self, progress, downloaded_bytes, total_bytes):
+        """Callback to update the GUI progress bar and status label."""
+        self.progress_var.set(progress)
+        if total_bytes > 0:
+            self.status_text_var.set(f"Downloading... {progress:.1f}% ({downloaded_bytes / (1024*1024):.2f}MB / {total_bytes / (1024*1024):.2f}MB)")
+        else:
+            self.status_text_var.set(f"Downloading... {downloaded_bytes / (1024*1024):.2f}MB")
+
+
+    def _extract_zip(self, zip_path, destination_path):
+        """
+        Extracts a ZIP file to the specified destination path.
+        Updates status bar during extraction.
+        """
+        self.logger.info(f"Starting extraction of {os.path.basename(zip_path)} to {destination_path}")
+        try:
+            with zipfile.ZipFile(zip_path, 'r') as zip_ref:
+                # Get list of members to potentially show progress (if needed for large files)
+                # For now, just extract directly and use indeterminate progress bar
+                zip_ref.extractall(destination_path)
+            self.logger.info(f"Successfully extracted {os.path.basename(zip_path)}.")
+            self.after(0, lambda: self.status_text_var.set("Extraction Complete."))
+        except zipfile.BadZipFile:
+            self.logger.error(f"Failed to extract {os.path.basename(zip_path)}: Not a valid ZIP file.", exc_info=True)
+            self.after(0, lambda: messagebox.showerror("Extraction Error", f"Failed to extract: '{os.path.basename(zip_path)}' is not a valid ZIP file."))
+            self.after(0, lambda: self.status_text_var.set("Extraction Failed."))
+            self._log_to_specific_file(logging.ERROR, f"Extraction failed (Bad ZIP file): {os.path.basename(zip_path)}", self.crash_log_file, exc_info=True)
+        except Exception as e:
+            self.logger.critical(f"Unexpected error during ZIP extraction of {os.path.basename(zip_path)}: {e}", exc_info=True)
+            self.after(0, lambda: messagebox.showerror("Extraction Error", f"An unexpected error occurred during extraction:\n{e}"))
+            self.after(0, lambda: self.status_text_var.set("Extraction Failed."))
+            self._log_to_specific_file(logging.CRITICAL, f"Critical error during extraction: {e}", self.crash_log_file, exc_info=True)
+
+
+    def _reset_status_bar(self):
+        """Resets the status bar to its default state."""
+        self.progress_var.set(0)
+        self.progressbar.stop()
+        self.progressbar.config(mode="determinate") # Reset to default mode
+        self.status_text_var.set("Ready")
 
     # --- Menu Bar Actions ---
     def _move_resources_folder(self):
